@@ -15,7 +15,7 @@ import { createSyncService } from "./sync.ts";
  * Config is parsed from `ConfigSchema` — see `./config.ts`.
  */
 export const datastore = {
-  type: "@keeb/mongodb-datastore",
+  type: "@magistr/mongodb-datastore",
   name: "MongoDB",
   description:
     "Stores swamp runtime coordination and datastore bytes in MongoDB — distributed locks with TTL + heartbeat + nonce fencing, plus manifest + content-addressed blob sync of the datastore tier between local cache and MongoDB. Blobs over 15MB are transparently chunked across multiple docs so they fit under MongoDB's 16MB BSON limit. Scoped by tenant + repo namespace. Requires MongoDB 4.0+ running as a replica set.",

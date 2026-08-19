@@ -1,6 +1,6 @@
 name: mongodb-datastore
 type: datastore
-collective: "@keeb"
+collective: "@magistr"
 version: 0.2.1
 description: |
   MongoDB-backed swamp datastore. Distributed locks with TTL + heartbeat +

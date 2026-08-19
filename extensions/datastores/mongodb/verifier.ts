@@ -13,7 +13,7 @@ export interface DatastoreVerifier {
   verify(): Promise<DatastoreHealthResult>;
 }
 
-const TYPE = "@keeb/mongodb-datastore";
+const TYPE = "@magistr/mongodb-datastore";
 
 export function createVerifier(
   cfg: MongoDatastoreConfig,
