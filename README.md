@@ -103,11 +103,11 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
 
   ```bash
   # Dry run is the default; nothing is deleted until you say so.
-  swamp model method run datastoreMaintenance sweep
+  swamp model method run datastore-maintenance sweep
 
-  swamp model method run datastoreMaintenance sweep --arg dryRun=false
-  swamp model method run datastoreMaintenance sweep --arg dryRun=false \
-    --arg 'namespaces=["other-repo"]' --arg skipBlobs=true
+  swamp model method run datastore-maintenance sweep --input '{"dryRun":false}'
+  swamp model method run datastore-maintenance sweep \
+    --input '{"dryRun":false,"namespaces":["other-repo"],"skipBlobs":true}'
   ```
 
   A push inserts a blob _before_ upserting the path doc that references it, so a
@@ -156,7 +156,7 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   44.1 GB reusable; compacting took it to 185 MB.
 
   ```bash
-  swamp model method run datastoreMaintenance compact
+  swamp model method run datastore-maintenance compact
   ```
 
   The method issues `compact` with `force: true`, which is required on a
@@ -181,7 +181,7 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   swamp vault create local_encryption datastore-vault
   swamp vault put datastore-vault MONGO_PASSWORD
 
-  swamp model create @magistr/mongodb-datastore/maintenance datastoreMaintenance \
+  swamp model create @magistr/mongodb-datastore/maintenance datastore-maintenance \
     --global-arg uri='mongodb://mongo.example.com:27017/?replicaSet=rs0&authSource=admin' \
     --global-arg username=swamp-user \
     --global-arg 'password=${{ vault.get(datastore-vault, MONGO_PASSWORD) }}' \
@@ -207,7 +207,7 @@ docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.
   Results are ordinary swamp data, tagged with workflow provenance:
 
   ```bash
-  swamp data query 'modelName == "datastoreMaintenance" && specName == "sweep"'
+  swamp data query 'modelName == "datastore-maintenance" && specName == "sweep"'
   ```
 
   This is the piece that prevents a repeat. The incident that motivated the

@@ -4,7 +4,7 @@ description: >-
   Reclaim space in a MongoDB-backed swamp datastore: snapshot every namespace,
   prune tombstones past grace and blobs no live path references, then return
   the freed space to the filesystem. Requires a
-  @magistr/mongodb-datastore/maintenance instance named datastoreMaintenance.
+  @magistr/mongodb-datastore/maintenance instance named datastore-maintenance.
 jobs:
   - name: reclaim
     description: Inventory, sweep, then compact — each step fans out over all namespaces
@@ -16,7 +16,7 @@ jobs:
           measurable against a recorded baseline.
         task:
           type: model_method
-          modelIdOrName: datastoreMaintenance
+          modelIdOrName: datastore-maintenance
           methodName: inventory
         dependsOn: []
         weight: 0
@@ -28,7 +28,7 @@ jobs:
           whose blobs predate the createdAt field.
         task:
           type: model_method
-          modelIdOrName: datastoreMaintenance
+          modelIdOrName: datastore-maintenance
           methodName: sweep
           inputs:
             dryRun: false
@@ -45,7 +45,7 @@ jobs:
           nothing to reclaim until the sweep has produced free blocks.
         task:
           type: model_method
-          modelIdOrName: datastoreMaintenance
+          modelIdOrName: datastore-maintenance
           methodName: compact
         dependsOn:
           - step: sweep
