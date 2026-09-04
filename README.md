@@ -59,6 +59,13 @@ Swamp picks it up on the next invocation.
 | `tenantId`         | string | no       | `default`        | Tenant identifier; part of the collection prefix.                           |
 | `namespace`        | string | yes      | —                | Per-repo identifier; part of the collection prefix.                         |
 | `defaultLockTtlMs` | number | no       | `30000`          | Default lock TTL. Must exceed your longest critical section.                |
+| `maxPoolSize`      | number | no       | `20`             | Max connections in the pool shared by every provider in the process.        |
+| `maxIdleTimeMS`    | number | no       | `60000`          | How long an idle pooled connection is kept before the driver closes it.     |
+
+One `MongoClient` is shared per cluster + repo for the life of the process, and
+every connection is stamped with an `appName` of
+`swamp:<tenantId>/<namespace>#<pid>` so `$currentOp` and mongod's logs can say
+which repo and process a connection belongs to.
 
 Collections are prefixed `t_<tenantId>_r_<namespace>_*` — `_locks` for lock
 docs, `_paths` for the manifest, `_blobs` for content-addressed bytes.

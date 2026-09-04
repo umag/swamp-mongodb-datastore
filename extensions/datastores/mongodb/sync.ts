@@ -227,11 +227,17 @@ export function createSyncService(
   // `prefixes`, when present, scopes the pull to `_paths` docs whose `_id`
   // begins with one of the given cache-relative prefixes (e.g.
   // `data/<modelType>/<modelId>/`). A scoped pull is a pure read
-  // optimization: it ignores the `lastPulledAt` floor (so it can fetch
-  // anything in-scope that's missing/stale locally) and — critically — does
-  // NOT advance the `lastPulledAt` watermark. The global watermark stays
-  // owned exclusively by the full, unscoped pull; bumping it here would make
-  // a later full pull skip every out-of-scope change in this window.
+  // optimization, and — critically — it does NOT advance the `lastPulledAt`
+  // watermark. The global watermark stays owned exclusively by the full,
+  // unscoped pull; bumping it here would make a later full pull skip every
+  // out-of-scope change in this window.
+  //
+  // It does keep its own floor per prefix (`scopeWatermarks`), which is what
+  // makes it incremental: without one it re-fetched every path doc under the
+  // prefix — tombstones included, since they carry no age filter — and
+  // re-hashed the whole local subtree, on every per-model lock. Core takes
+  // those locks per workflow step, so that cost multiplied by step count.
+  // See scopeFloor for why `lastPulledAt` alone can't serve as the floor.
   async function pull(opts?: {
     prefixes?: string[];
     metadataOnly?: boolean;
@@ -257,11 +263,7 @@ export function createSyncService(
     }
 
     const baseFilter = scoped
-      ? {
-        $or: prefixes!.map((p) => ({
-          _id: { $regex: `^${escapeRegex(p)}` },
-        })),
-      }
+      ? scopedPullFilter(prefixes!, state)
       : state.lastPulledAt !== null
       ? { updatedAt: { $gt: new Date(state.lastPulledAt) } }
       : {};
@@ -272,17 +274,30 @@ export function createSyncService(
     const filter = metadataOnly
       ? { $and: [baseFilter, { _id: { $not: rawContentRegex() } }] }
       : baseFilter;
-    // A scoped pull always hash-compares against local state (never the
-    // cold-start bulk path) — it has no watermark history to lean on.
+    // A scoped pull always hash-compares against local state: its floor says
+    // the prefix was in sync at that instant, not that every doc past it is
+    // absent locally, so the cold-start bulk path (skip the compare, fetch
+    // everything) would re-download files the cache already holds.
     const coldStart = !scoped && state.lastPulledAt === null;
 
+    // Stamped before the cursor opens: a doc a peer writes while we stream is
+    // newer than this, so an empty scope still leaves that write reachable.
+    const openedAt = new Date().toISOString();
     const pathDocs: PathDoc[] = [];
+    // Per-prefix max updatedAt, for the scope watermarks this pull records.
+    const scopeMaxMs = new Map<string, number>();
     let maxUpdatedAtMs = state.lastPulledAt !== null
       ? new Date(state.lastPulledAt).getTime()
       : 0;
     for await (const doc of paths.find(filter)) {
       const ms = doc.updatedAt.getTime();
       if (ms > maxUpdatedAtMs) maxUpdatedAtMs = ms;
+      if (scoped) {
+        const owner = prefixes!.find((p) => doc._id.startsWith(p));
+        if (owner !== undefined && ms > (scopeMaxMs.get(owner) ?? 0)) {
+          scopeMaxMs.set(owner, ms);
+        }
+      }
       // Never hydrate vault secrets or host-local files, even if an older
       // version synced them. Advance the watermark past the doc (above) so it
       // isn't re-scanned, but don't write or delete it locally — a stale
@@ -339,6 +354,25 @@ export function createSyncService(
         await writeFileAtomic(`${cachePath}/${relPath}`, bytes);
         changes++;
       });
+    }
+
+    if (scoped && !metadataOnly) {
+      // Every path under these prefixes is now hydrated up to the point we
+      // reached. Recorded per prefix, never as `lastPulledAt`: this pull saw
+      // one slice of the manifest, and the global watermark means the whole
+      // of it. A metadataOnly pull is excluded — it skipped `data/.../raw`,
+      // so its position would hide those docs from the next scoped pull.
+      const advanced: Record<string, string> = {};
+      for (const p of prefixes!) {
+        const seen = scopeMaxMs.get(p);
+        // Nothing matched: the floor held, so carry it forward. On the first
+        // pull of a prefix there is no floor yet, and `openedAt` records that
+        // the prefix was empty as of then.
+        advanced[p] = seen !== undefined
+          ? new Date(seen).toISOString()
+          : scopeFloor(state, p) ?? openedAt;
+      }
+      await sidecar.advanceScopeWatermarks(advanced);
     }
 
     if (!scoped && !metadataOnly) {
@@ -791,6 +825,54 @@ export function createSyncService(
       await writeFileAtomic(absPath, bytes);
       return true;
     },
+  };
+}
+
+// The instant up to which this cache is known to hold every path under
+// `prefix` — the floor a scoped pull filters on.
+//
+// It is the later of two facts. `scopeWatermarks[prefix]` is what a previous
+// scoped pull of this prefix established. `lastPulledAt` also qualifies:
+// only a full, non-metadataOnly, unscoped pull sets it, and that pull
+// hydrated everything — including this prefix.
+//
+// Neither alone is enough. `lastPulledAt` is untouched by scoped pulls, and
+// core scopes nearly every pull once `scopedSync` is advertised, so on a host
+// that mostly runs methods and workflows it can sit months behind while the
+// repo is written to daily — every doc under every prefix then reads as new
+// and no probe against it can ever fire. Conversely a brand-new prefix has no
+// scope watermark, but a full pull may already have covered it.
+export function scopeFloor(
+  state: Pick<SidecarState, "scopeWatermarks" | "lastPulledAt">,
+  prefix: string,
+): string | null {
+  const own = state.scopeWatermarks[prefix] ?? null;
+  const global = state.lastPulledAt;
+  if (own === null) return global;
+  if (global === null) return own;
+  return own > global ? own : global;
+}
+
+// Filter for a scoped pull: each prefix carries its own floor, so a step that
+// locks a hot model and a dormant one doesn't rescan the dormant one.
+//
+// A prefix with no floor matches everything beneath it — the pre-watermark
+// behavior, paid once, after which the pull records a floor.
+export function scopedPullFilter(
+  prefixes: string[],
+  state: Pick<SidecarState, "scopeWatermarks" | "lastPulledAt">,
+): { $or: Array<Record<string, unknown>> } {
+  return {
+    $or: prefixes.map((p) => {
+      // Anchored and un-escaped at the leading `^`, so MongoDB can turn the
+      // regex into index bounds on `_id` rather than scanning the collection.
+      const clause: Record<string, unknown> = {
+        _id: { $regex: `^${escapeRegex(p)}` },
+      };
+      const floor = scopeFloor(state, p);
+      if (floor !== null) clause.updatedAt = { $gt: new Date(floor) };
+      return clause;
+    }),
   };
 }
 
