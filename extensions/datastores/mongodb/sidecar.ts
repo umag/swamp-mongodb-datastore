@@ -20,6 +20,7 @@
 //   - lastPulledAt — high-water-mark over _fs_meta.updatedAt. Anything in
 //                    Mongo with updatedAt > lastPulledAt is potentially new
 //                    work from another host. Read by pullChanged on entry.
+//   - scopeWatermarks — the same idea per model prefix, for scoped pulls.
 //   - lazyPullActive / pushBootstrapped — see field docs below.
 //
 // Atomicity: scalar mutations are read-modify-write under a process-local
@@ -37,6 +38,13 @@ const CURRENT_SCHEMA_VERSION = 2;
 // bulkWrites, while per-root work costs at least one manifest query each.
 // Hitting the cap degrades to bulkInvalidated rather than growing unbounded.
 export const MAX_DIRTY_PATHS = 10_000;
+
+// Scope watermarks are keyed by model prefix, so the map is bounded by the
+// number of models a repo has ever locked — tens, normally. The cap only
+// exists so a repo that churns model ids can't grow the sidecar without
+// bound; evicting the oldest entries costs one full-prefix scan each, not
+// correctness.
+export const MAX_SCOPE_WATERMARKS = 512;
 
 export interface SidecarState {
   version: number;
@@ -63,6 +71,19 @@ export interface SidecarState {
   // — at that instant we genuinely did observe the whole remote list — while
   // leaving lastPulledAt alone so a pull still re-fetches content it lacks.
   lastReconciledAt: string | null;
+  // Per-model-prefix equivalent of lastPulledAt: `data/<type>/<id>/` -> the
+  // newest updatedAt this cache has hydrated *under that prefix*. Written by a
+  // completed scoped pull, which is the only pull that can vouch for a slice
+  // without having seen the whole manifest.
+  //
+  // Needed because lastPulledAt is advanced only by an unscoped pull, and
+  // `scopedSync: true` means core scopes almost every pull — so on a host that
+  // mostly runs methods and workflows the global watermark goes stale (four
+  // months, on this extension's own repo) and can't gate anything. Without a
+  // per-scope floor, a scoped pull has no watermark to lean on and degrades to
+  // "fetch every path doc under the prefix, live and tombstoned, then re-read
+  // and re-hash every local file" on every single lock acquisition.
+  scopeWatermarks: Record<string, string>;
   // True while this cache holds an un-hydrated tree: set by a metadataOnly
   // (lazy) pull, cleared by a full (non-metadataOnly, unscoped) pull that
   // brings the cache fully in sync. While true, the local cache is NOT a
@@ -87,6 +108,7 @@ interface Scalars {
   bulkInvalidated: boolean;
   lastPulledAt: string | null;
   lastReconciledAt: string | null;
+  scopeWatermarks: Record<string, string>;
   lazyPullActive: boolean;
   pushBootstrapped: boolean;
 }
@@ -97,6 +119,7 @@ function emptyScalars(): Scalars {
     bulkInvalidated: false,
     lastPulledAt: null,
     lastReconciledAt: null,
+    scopeWatermarks: {},
     lazyPullActive: false,
     pushBootstrapped: false,
   };
@@ -138,6 +161,17 @@ function journalPath(cachePath: string): string {
   return `${cachePath}/${JOURNAL_FILENAME}`;
 }
 
+function normalizeScopeWatermarks(parsed: unknown): Record<string, string> {
+  if (typeof parsed !== "object" || parsed === null) return {};
+  const out: Record<string, string> = {};
+  for (const [prefix, iso] of Object.entries(parsed)) {
+    // A non-string value is a corrupt entry; dropping it just means the next
+    // pull rescans that prefix.
+    if (typeof iso === "string") out[prefix] = iso;
+  }
+  return out;
+}
+
 function normalizeScalars(parsed: unknown): {
   scalars: Scalars;
   legacyDirty: string[];
@@ -172,6 +206,11 @@ function normalizeScalars(parsed: unknown): {
       lastReconciledAt: typeof obj.lastReconciledAt === "string"
         ? obj.lastReconciledAt
         : null,
+      // Absent on sidecars written before scope watermarks existed. Still
+      // schema v2: an empty map costs one full-prefix scan per model and then
+      // self-heals, which is exactly the pre-upgrade behavior — not worth
+      // forcing every deployed cache through a bulkInvalidated full walk.
+      scopeWatermarks: normalizeScopeWatermarks(obj.scopeWatermarks),
       lazyPullActive: obj.lazyPullActive === true,
       pushBootstrapped: obj.pushBootstrapped === true,
     },
@@ -368,6 +407,7 @@ export class Sidecar {
       bulkInvalidated: s.bulkInvalidated,
       lastPulledAt: s.lastPulledAt,
       lastReconciledAt: s.lastReconciledAt,
+      scopeWatermarks: { ...s.scopeWatermarks },
       lazyPullActive: s.lazyPullActive,
       pushBootstrapped: s.pushBootstrapped,
     };
@@ -489,6 +529,35 @@ export class Sidecar {
       // Monotonic: an older reconcile point never overwrites a newer one.
       if (s.lastReconciledAt === null || s.lastReconciledAt < iso) {
         s.lastReconciledAt = iso;
+      }
+    });
+  }
+
+  // Records that every path under each given prefix is hydrated as of that
+  // prefix's instant. Only a completed, non-metadataOnly scoped pull may call
+  // this: a metadataOnly pull deliberately skips `data/.../raw`, so recording
+  // its position would move the floor past docs it never fetched.
+  advanceScopeWatermarks(
+    entries: Record<string, string>,
+  ): Promise<SidecarState> {
+    return this.updateScalars((s) => {
+      for (const [prefix, iso] of Object.entries(entries)) {
+        // Monotonic per prefix, for the same reason lastReconciledAt is: two
+        // pulls can interleave, and the older one's position must not pull the
+        // floor backwards.
+        const prev = s.scopeWatermarks[prefix];
+        if (prev === undefined || prev < iso) s.scopeWatermarks[prefix] = iso;
+      }
+      const keys = Object.keys(s.scopeWatermarks);
+      if (keys.length > MAX_SCOPE_WATERMARKS) {
+        // Evict the oldest floors — those prefixes pay one rescan and are
+        // recorded again.
+        keys.sort((a, b) =>
+          s.scopeWatermarks[a] < s.scopeWatermarks[b] ? -1 : 1
+        );
+        for (const k of keys.slice(0, keys.length - MAX_SCOPE_WATERMARKS)) {
+          delete s.scopeWatermarks[k];
+        }
       }
     });
   }

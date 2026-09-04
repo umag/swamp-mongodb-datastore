@@ -102,12 +102,20 @@ you're targeting.
    dirtied file, under the global lock. On push the journal is coalesced so a
    dirty directory absorbs everything beneath it, and past `MAX_DIRTY_PATHS` it
    degrades to one full walk.
-6. **Two watermarks.** `lastPulledAt` = content hydrated to here (drives pull).
-   `lastReconciledAt` = complete remote path list observed to here (drives the
-   push tombstone pass). Conflating them means a host can never propagate
-   deletion of data it pushed itself, because its own push stamps
-   `updatedAt = now`, and the tombstone pass skips anything newer than the
-   watermark in order to protect a peer's concurrent writes.
+6. **Three watermarks.** `lastPulledAt` = content hydrated to here (drives the
+   unscoped pull). `lastReconciledAt` = complete remote path list observed to
+   here (drives the push tombstone pass). Conflating those two means a host can
+   never propagate deletion of data it pushed itself, because its own push
+   stamps `updatedAt = now`, and the tombstone pass skips anything newer than
+   the watermark in order to protect a peer's concurrent writes.
+   `scopeWatermarks[prefix]` = that model's slice hydrated to here (drives the
+   scoped pull). Neither of the other two can stand in for it: `lastPulledAt` is
+   advanced only by an unscoped pull, and since `capabilities()` advertises
+   `scopedSync`, core scopes nearly every pull — so on a host that mostly runs
+   methods and workflows the global watermark sits months behind a repo that is
+   written to daily. Without a per-scope floor, every per-model lock re-fetched
+   the prefix's entire path list, tombstones included, and re-hashed the whole
+   local subtree (issue #11).
 7. **`_blobs` is append-only; reclamation is out of band.** Dedup means a push
    can't tell whether another path still references a hash, so it must never
    delete. The `sweep` method reclaims unreferenced blobs, guarded by a
